@@ -20,20 +20,11 @@ PINS_DIR = BRIDGE_DIR / "pins"
 BACKUP_DIR = BRIDGE_DIR / "backups"
 MAX_INJECT_BYTES = int(os.environ.get("BRAIN_BRIDGE_MAX_BYTES", 30000))
 
-# 大块 tool output 的截断阈值（超过这个长度的 content 只保留摘要）
+# 大块 tool output 的截断阈值
 TOOL_OUTPUT_TRIM = 200
 
 PINS_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def find_transcript_path():
-    """从 stdin 的 PreCompact hook JSON 输入中提取 transcript_path"""
-    try:
-        hook_input = json.load(sys.stdin)
-        return hook_input.get("transcript_path", "")
-    except (json.JSONDecodeError, EOFError):
-        return ""
 
 
 def parse_transcript(path: str) -> list:
@@ -58,7 +49,7 @@ def parse_transcript(path: str) -> list:
 def extract_readable(messages: list) -> list:
     """
     从消息列表中提取人类可读的对话内容。
-    跳过大块 tool output，只保留 user/assistant 的文字部分。
+    保留工具调用摘要（#9），跳过大块 tool output。
     """
     readable = []
 
@@ -80,7 +71,6 @@ def extract_readable(messages: list) -> list:
         if isinstance(content, str):
             text = content.strip()
         elif isinstance(content, list):
-            # 提取 text 类型的 block，跳过 tool_use/tool_result/image
             parts = []
             for block in content:
                 if isinstance(block, dict):
@@ -88,10 +78,14 @@ def extract_readable(messages: list) -> list:
                     if btype == "text":
                         parts.append(block.get("text", ""))
                     elif btype == "tool_use":
+                        # #9 保留工具名和简要输入
                         tool_name = block.get("name", "unknown")
-                        parts.append(f"[调用工具: {tool_name}]")
+                        tool_input = str(block.get("input", ""))
+                        if len(tool_input) > TOOL_OUTPUT_TRIM:
+                            tool_input = tool_input[:TOOL_OUTPUT_TRIM] + "..."
+                        parts.append(f"[调用工具: {tool_name}({tool_input})]")
                     elif btype == "tool_result":
-                        # tool output 只保留摘要
+                        # #9 tool output 保留前200字符摘要
                         result_content = str(block.get("content", ""))
                         if len(result_content) > TOOL_OUTPUT_TRIM:
                             result_content = result_content[:TOOL_OUTPUT_TRIM] + "...(截断)"
@@ -110,7 +104,10 @@ def extract_readable(messages: list) -> list:
 
 
 def tail_to_budget(readable: list, max_bytes: int) -> list:
-    """从后往前截取，控制在字节预算内"""
+    """
+    从后往前截取，控制在字节预算内。
+    #4 如果最后一条消息超预算，截断保留尾部内容而非整条丢弃。
+    """
     result = []
     total = 0
 
@@ -119,6 +116,26 @@ def tail_to_budget(readable: list, max_bytes: int) -> list:
         entry_bytes = len(entry.encode("utf-8"))
 
         if total + entry_bytes > max_bytes:
+            # #4 如果 result 为空（即最后一条就超预算），截断这条消息
+            if not result:
+                remaining = max_bytes - total - 50  # 留 50 bytes 给标记
+                if remaining > 200:
+                    text_bytes = msg["text"].encode("utf-8")
+                    # 从尾部截取 remaining 字节，找到合法 UTF-8 边界
+                    truncated = text_bytes[-remaining:]
+                    # 跳过可能的不完整 UTF-8 字符
+                    for i in range(min(4, len(truncated))):
+                        try:
+                            truncated_text = truncated[i:].decode("utf-8")
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    else:
+                        truncated_text = truncated.decode("utf-8", errors="replace")
+                    result.append({
+                        "role": msg["role"],
+                        "text": f"...(前文截断)\n{truncated_text}"
+                    })
             break
 
         result.append(msg)
@@ -138,14 +155,11 @@ def format_output(messages: list) -> str:
 
 
 def main():
-    # 获取 transcript 路径
     transcript_path = ""
 
-    # 优先从命令行参数
     if len(sys.argv) > 2 and sys.argv[1] == "--transcript":
         transcript_path = sys.argv[2]
     else:
-        # 从 stdin（hook 输入）
         if not sys.stdin.isatty():
             try:
                 hook_input = json.load(sys.stdin)
@@ -179,7 +193,6 @@ def main():
         sys.exit(0)
 
     # 3. 倒着截取，控制在预算内
-    # 注入预算：总预算的 70%，留 30% 给手动 pin
     inject_budget = int(MAX_INJECT_BYTES * 0.7)
     tail = tail_to_budget(readable, inject_budget)
 

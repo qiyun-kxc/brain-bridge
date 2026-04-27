@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# brain-bridge — 晦的大脑续接工具
+# brain-bridge — Claude Code 大脑续接工具
 # 压缩前自动备份上下文，压缩后自动注入最后几轮对话 + 手动 pin 的内容
 #
 # 两层 hook:
@@ -13,6 +13,7 @@ PINS_DIR="$BRIDGE_DIR/pins"
 LOG_FILE="$BRIDGE_DIR/inject.log"
 MAX_INJECT_BYTES="${BRAIN_BRIDGE_MAX_BYTES:-30000}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TAG_PATTERN='^[A-Za-z0-9_-]+$'
 
 mkdir -p "$PINS_DIR"
 
@@ -25,7 +26,7 @@ RESET='\033[0m'
 
 usage() {
   cat <<'EOF'
-brain-bridge — 晦的大脑续接工具 🧠🌉
+brain-bridge — Claude Code 大脑续接工具 🧠🌉
 
 自动:
   bridge.sh snapshot                  PreCompact hook 调用，备份并截取上下文
@@ -45,11 +46,22 @@ brain-bridge — 晦的大脑续接工具 🧠🌉
   bridge.sh status                     查看状态统计
   bridge.sh backups                    列出 transcript 备份
 
+Tag 命名规则: 仅允许字母、数字、下划线、短横线
+
 工作流:
   压缩即将发生 → PreCompact hook → snapshot（备份+截取尾部）
   压缩完成     → SessionStart hook → inject（注入截取的上下文+手动pin）
   晦继续工作，关键上下文还在。需要更多细节可 Read 完整备份。
 EOF
+}
+
+# ── 校验 tag ──
+validate_tag() {
+  local tag="$1"
+  if [[ ! "$tag" =~ $TAG_PATTERN ]]; then
+    echo -e "${RED}错误: tag 只允许字母、数字、下划线、短横线，收到: '${tag}'${RESET}" >&2
+    return 1
+  fi
 }
 
 # ── snapshot (PreCompact hook) ──
@@ -58,7 +70,6 @@ cmd_snapshot() {
     echo "snapshot.py not found in $SCRIPT_DIR" >&2
     exit 1
   fi
-  # stdin 是 PreCompact hook 的 JSON 输入，直接转发给 snapshot.py
   python3 "$SCRIPT_DIR/snapshot.py"
 }
 
@@ -70,6 +81,8 @@ cmd_pin() {
   fi
 
   local tag="$1"; shift
+  validate_tag "$tag" || return 1
+
   local mode="pin"
   local message=""
   local source_file=""
@@ -127,6 +140,7 @@ cmd_list() {
 # ── show ──
 cmd_show() {
   local tag="${1:?需要 tag 名称}"
+  validate_tag "$tag" || return 1
   if [[ -f "$PINS_DIR/${tag}.pin" ]]; then cat "$PINS_DIR/${tag}.pin"
   elif [[ -f "$PINS_DIR/${tag}.once" ]]; then cat "$PINS_DIR/${tag}.once"
   else echo -e "${RED}Pin '${tag}' 不存在${RESET}" >&2; return 1; fi
@@ -135,6 +149,7 @@ cmd_show() {
 # ── rm ──
 cmd_rm() {
   local tag="${1:?需要 tag 名称}"
+  validate_tag "$tag" || return 1
   local removed=0
   for ext in pin once; do
     [[ -f "$PINS_DIR/${tag}.${ext}" ]] && { rm "$PINS_DIR/${tag}.${ext}"; removed=1; }
@@ -151,15 +166,35 @@ cmd_clear() {
   echo -e "${GREEN}已清空${RESET} ${count} 个 pin"
 }
 
-# ── inject (SessionStart compact hook) ──
+# ── inject (SessionStart compact hook) ── #1 JSON输出 #2 备份.once #3 注入顺序
 cmd_inject() {
-  local found=0
   local total_size=0
-  local output=""
+  local context_parts=""
 
-  for f in "$PINS_DIR"/*.pin "$PINS_DIR"/*.once; do
+  # #3 优先级: pre-compact-context.once → 其他 .once → .pin
+  local ordered_files=()
+
+  # 第一优先: 自动快照
+  if [[ -f "$PINS_DIR/pre-compact-context.once" ]]; then
+    ordered_files+=("$PINS_DIR/pre-compact-context.once")
+  fi
+
+  # 第二优先: 其他 .once 文件
+  for f in "$PINS_DIR"/*.once; do
     [[ -f "$f" ]] || continue
-    found=1
+    [[ "$(basename "$f")" == "pre-compact-context.once" ]] && continue
+    ordered_files+=("$f")
+  done
+
+  # 第三优先: 持久 .pin 文件
+  for f in "$PINS_DIR"/*.pin; do
+    [[ -f "$f" ]] || continue
+    ordered_files+=("$f")
+  done
+
+  [[ ${#ordered_files[@]} -eq 0 ]] && return 0
+
+  for f in "${ordered_files[@]}"; do
     local basename=$(basename "$f")
     local tag="${basename%.*}"
     local ext="${basename##*.}"
@@ -167,35 +202,49 @@ cmd_inject() {
     total_size=$((total_size + size))
 
     if [[ $total_size -gt $MAX_INJECT_BYTES ]]; then
-      output+="### ⚠️ ${tag} (跳过: 超出注入上限)\n\n"
+      context_parts+="### ⚠️ ${tag} (跳过: 超出注入上限)\n\n"
       continue
     fi
 
     local content=$(cat "$f")
     local mode_label=""
     [[ "$ext" == "once" ]] && mode_label=" ⏳一次性"
-    output+="### 📌 ${tag}${mode_label}\n${content}\n\n"
+    context_parts+="### 📌 ${tag}${mode_label}\n${content}\n\n"
   done
 
-  [[ $found -eq 0 ]] && return 0
+  # 组装完整注入内容
+  local full_context=""
+  full_context+="## 🧠 Brain Bridge: 大脑续接\n\n"
+  full_context+="以下是压缩前的上下文快照和手动 pin 的内容。\n"
+  full_context+="如需更多细节，完整备份在 ~/.claude/brain-bridge/backups/ 下。\n\n"
+  full_context+="$(echo -e "$context_parts")"
+  full_context+="\n---\n_共注入 ${total_size} bytes。_"
 
-  echo "## 🧠 Brain Bridge: 大脑续接"
-  echo ""
-  echo "以下是压缩前的上下文快照和手动 pin 的内容。"
-  echo "如需更多细节，完整备份在 ~/.claude/brain-bridge/backups/ 下。"
-  echo ""
-  echo -e "$output"
-  echo "---"
-  echo "_共注入 ${total_size} bytes。_"
+  # #1 输出 JSON 格式供 SessionStart hook 消费
+  local escaped_context
+  escaped_context=$(echo -e "$full_context" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
 
+  cat <<ENDJSON
+{
+  "hookSpecificOutput": {
+    "hookEventName": "SessionStart",
+    "additionalContext": ${escaped_context}
+  }
+}
+ENDJSON
+
+  # #2 .once 文件: 备份后再删除
   for f in "$PINS_DIR"/*.once; do
-    [[ -f "$f" ]] && rm "$f"
+    if [[ -f "$f" ]]; then
+      cp "$f" "${f}.bak"
+      rm "$f"
+    fi
   done
 
   echo "[$(date -Iseconds)] Injected: total=${total_size}B" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# ── install ──
+# ── install ── #5 精确匹配
 cmd_install() {
   local settings_file="$HOME/.claude/settings.json"
   local bridge_path="$SCRIPT_DIR/$(basename "$0")"
@@ -213,17 +262,16 @@ cmd_install() {
     return 1
   fi
 
-  # 检查是否已安装
+  # #5 精确检测: command 必须包含 bridge 路径且包含对应子命令
   local has_precompact=false has_sessionstart=false
-  jq -e '.hooks.PreCompact[]? | select(.hooks[]?.command | contains("bridge"))' "$settings_file" &>/dev/null && has_precompact=true
-  jq -e '.hooks.SessionStart[]? | select(.matcher == "compact")' "$settings_file" &>/dev/null && has_sessionstart=true
+  jq -e ".hooks.PreCompact[]? | select(.hooks[]?.command | (contains(\"brain-bridge\") and contains(\"snapshot\")))" "$settings_file" &>/dev/null && has_precompact=true
+  jq -e ".hooks.SessionStart[]? | select(.matcher == \"compact\" and (.hooks[]?.command | (contains(\"brain-bridge\") and contains(\"inject\"))))" "$settings_file" &>/dev/null && has_sessionstart=true
 
   if $has_precompact && $has_sessionstart; then
     echo -e "${GREEN}✓ 双层 hook 已安装${RESET}"
     return 0
   fi
 
-  # 构建 hook 配置
   local precompact_hook=$(cat <<HOOKJSON
 {
   "hooks": [
@@ -316,19 +364,17 @@ cmd_status() {
     printf "  使用率: ${color}%d%%${RESET}\n" "$pct"
   fi
 
-  # Hook 检查
   local settings_file="$HOME/.claude/settings.json"
   if [[ -f "$settings_file" ]] && command -v jq &>/dev/null; then
     local pre="✗" post="✗"
-    jq -e '.hooks.PreCompact[]? | select(.hooks[]?.command | contains("bridge"))' "$settings_file" &>/dev/null && pre="✓"
-    jq -e '.hooks.SessionStart[]? | select(.matcher == "compact")' "$settings_file" &>/dev/null && post="✓"
+    jq -e '.hooks.PreCompact[]? | select(.hooks[]?.command | (contains("brain-bridge") and contains("snapshot")))' "$settings_file" &>/dev/null && pre="✓"
+    jq -e '.hooks.SessionStart[]? | select(.matcher == "compact" and (.hooks[]?.command | (contains("brain-bridge") and contains("inject"))))' "$settings_file" &>/dev/null && post="✓"
     echo ""
     echo -e "  PreCompact hook:  $([ "$pre" = "✓" ] && echo "${GREEN}✓${RESET}" || echo "${RED}✗${RESET}")"
     echo -e "  SessionStart hook: $([ "$post" = "✓" ] && echo "${GREEN}✓${RESET}" || echo "${RED}✗${RESET}")"
     [[ "$pre" = "✗" || "$post" = "✗" ]] && echo -e "  ${DIM}运行 bridge.sh install 安装${RESET}"
   fi
 
-  # 备份统计
   local backup_count=0
   if [[ -d "$BRIDGE_DIR/backups" ]]; then
     backup_count=$(ls "$BRIDGE_DIR/backups"/transcript_*.jsonl 2>/dev/null | wc -l)
